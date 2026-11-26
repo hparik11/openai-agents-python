@@ -1,10 +1,12 @@
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import httpx2
 import pytest
+from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion, Choice as ChatCompletionChoice
 from openai.types.chat.chat_completion_chunk import (
     ChatCompletionChunk,
@@ -4310,6 +4312,65 @@ async def test_streamed_run_does_not_double_count_when_usage_is_present(monkeypa
 
     assert result.context_wrapper.usage.requests == 1
     assert result.context_wrapper.usage.total_tokens == 12
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_streamed_run_counts_usage_for_truncated_empty_turn() -> None:
+    """A length-truncated empty stream still bills, so run usage must count it.
+    The stream raises ModelBehaviorError for the truncated turn. The reported
+    usage must reach RunContextWrapper.usage through the error.
+    """
+
+    usage_payload = {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "completion_tokens_details": {"reasoning_tokens": 50},
+    }
+
+    def sse() -> str:
+        base = {
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-x",
+        }
+        chunks = [
+            {
+                **base,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+            {**base, "choices": [], "usage": usage_payload},
+        ]
+        return "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+def handler(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(
+        200,
+        text=sse(),
+        headers={"content-type": "text/event-stream"},
+    )
+
+async with AsyncOpenAI(
+    api_key="test",
+    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+) as client:
+    agent = Agent(name="test", model=OpenAIChatCompletionsModel("gpt-x", client))
+    result = Runner.run_streamed(agent, "hi")
+    with pytest.raises(ModelBehaviorError, match="finish_reason='length'"):
+        async for _ in result.stream_events():
+            pass
+
+    usage = result.context_wrapper.usage
+    assert (
+        usage.requests,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+    ) == (1, 100, 50, 150)
+
 
 
 @pytest.mark.allow_call_model_methods
