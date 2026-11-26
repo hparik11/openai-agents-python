@@ -806,6 +806,57 @@ async def test_get_response_traces_usage_on_truncated_empty_turn(monkeypatch) ->
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_runner_counts_usage_for_truncated_empty_turn() -> None:
+    """A length-truncated empty turn still bills, so run usage must count it.
+    The model raises ModelBehaviorError for the truncated turn. The reported
+    usage must reach RunContextWrapper.usage through the error.
+    """
+
+    usage_payload = {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "completion_tokens_details": {"reasoning_tokens": 50},
+    }
+
+def handler(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(
+        200,
+        json={
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-x",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": None},
+                }
+            ],
+            "usage": usage_payload,
+        },
+    )
+
+async with AsyncOpenAI(
+    api_key="test",
+    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+) as client:
+    agent = Agent(name="test", model=OpenAIChatCompletionsModel("gpt-x", client))
+    with pytest.raises(ModelBehaviorError) as exc_info:
+        await Runner.run(agent, "hi")
+
+    usage = exc_info.value.run_data.context_wrapper.usage
+    assert (
+        usage.requests,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+    ) == (1, 100, 50, 150)
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("message", "expected_output_type", "expected_content_type"),
     [
