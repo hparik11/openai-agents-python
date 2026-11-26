@@ -34,6 +34,8 @@ from ..tracing.spans import Span
 from ..usage import (
     Usage,
     _raw_usage_snapshot,
+    _response_usage_to_usage,
+
 )
 from ..util._error_tracing import model_span_errors
 from ..util._json import _to_dump_compatible
@@ -358,10 +360,13 @@ class OpenAIChatCompletionsModel(Model):
                 and not message.refusal
                 and not message.tool_calls
             ):
-                raise ModelBehaviorError(
+                error = ModelBehaviorError(
                     "Chat Completions response terminated with finish_reason='length' "
                     "but produced no assistant text, tool call, or refusal."
                 )
+                                if response.usage is not None:
+                                                        error._terminal_usage = usage
+                                                    raise error
 
             if tracing.include_data():
                 span_generation.span_data.output = (
@@ -529,10 +534,13 @@ class OpenAIChatCompletionsModel(Model):
                         )
 
                     yield chunk
-            except ModelBehaviorError:
+            except ModelBehaviorError as error:
                 # The handler preserves the request and any reported token usage on the
                 # base response before raising (e.g. a token-budget-exhausted empty
-                # completion). Attach it to the span before the error surfaces.
+                # completion). Attach it to the span and to the error before it surfaces,
+                                # so the run loop can count the billed request in run usage.
+                                if response.usage is not None:
+                                                        error._terminal_usage = _response_usage_to_usage(response.usage)
                 self._populate_stream_generation_span(span_generation, response, tracing)
                 raise
             except asyncio.CancelledError:
